@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const { OpenAI } = require('openai');
 const bcrypt = require('bcryptjs');
@@ -9,10 +11,25 @@ const db = require('./db');
 
 dotenv.config();
 
+if (!process.env.JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET environment variable is required. Set JWT_SECRET in .env or environment and restart.');
+  process.exit(1);
+}
+
 const app = express();
-app.use(cors());
+app.use(cors({ origin: (process.env.CORS_ORIGINS || 'http://localhost:3002').split(',') }));
+app.use(helmet());
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+app.use('/api/', apiLimiter);
 app.use(express.json());
-app.use(express.static(__dirname));
+// Block sensitive files (.db, .env, .git, etc.) — index.html is served via explicit routes below.
+app.use((req, res, next) => {
+  if (/\.(db|db-journal|sqlite|sqlite-journal|env)$/i.test(req.path) || req.path.includes('/.git') || /(^|\/)node_modules(\/|$)/.test(req.path)) {
+    return res.status(403).send('Forbidden');
+  }
+  next();
+});
+app.use(express.static(__dirname, { dotfiles: 'deny', index: false }));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
@@ -33,7 +50,7 @@ app.get('/logo.svg', (req, res) => {
   res.sendFile(path.join(__dirname, 'logo.svg'));
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'tailorfit_ai_jwt_secret_2026';
+const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = process.env.PORT || 3002;
 
 app.use(async (req, res, next) => {
@@ -68,9 +85,13 @@ function requireAuth(req, res, next) {
   });
 }
 
+const AI_ENABLED = Boolean(process.env.OMNIROUTE_API_KEY);
+if (!AI_ENABLED) {
+  console.warn('[WARN] OMNIROUTE_API_KEY not set — AI_ENABLED=false, /api/analyze will return 503.');
+}
 const omniRouteClient = new OpenAI({
   baseURL: process.env.OMNIROUTE_GATEWAY_URL || 'https://integrate.api.nvidia.com/v1',
-  apiKey: process.env.OMNIROUTE_API_KEY || 'dummy_nim_key'
+  apiKey: process.env.OMNIROUTE_API_KEY || ''
 });
 
 const SYSTEM_PROMPT = `
@@ -188,6 +209,15 @@ app.post('/api/analyze', authenticateToken, async (req, res) => {
   const { resume, jobDescription } = req.body;
   if (!resume || !jobDescription) {
     return res.status(400).json({ error: 'Both candidate resume and target job description are required' });
+  }
+  if (typeof resume === 'string' && resume.length > 15000) {
+    return res.status(400).json({ error: 'Resume exceeds maximum length of 15000 characters' });
+  }
+  if (typeof jobDescription === 'string' && jobDescription.length > 15000) {
+    return res.status(400).json({ error: 'Job description exceeds maximum length of 15000 characters' });
+  }
+  if (!AI_ENABLED) {
+    return res.status(503).json({ error: 'AI service disabled: OMNIROUTE_API_KEY is not configured' });
   }
 
   const promptContent = `--- CANDIDATE RESUME ---\n${resume}\n\n--- TARGET JOB DESCRIPTION ---\n${jobDescription}`;

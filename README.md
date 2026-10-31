@@ -113,3 +113,8 @@ Developed with ❤️ as part of the **12 AI Blueprints Series**.
 ## 📜 License
 
 Distributed under the **MIT License**. See `LICENSE` for more information.
+
+---
+
+## Demo data note
+Demo mode — your data lives in temporary storage and resets when the server restarts or redeploys. Connect a persistent database (e.g. Supabase Postgres) for production.

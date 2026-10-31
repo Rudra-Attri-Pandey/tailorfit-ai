@@ -1,4 +1,9 @@
 document.addEventListener('DOMContentLoaded', () => {
+  // XSS guard: escape user-supplied / AI-generated strings before innerHTML
+  function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
   const resumeInput = document.getElementById('resume-input');
   const jobInput = document.getElementById('job-input');
   const optimizeBtn = document.getElementById('optimize-btn');
@@ -262,10 +267,10 @@ Product Strategy, A/B Testing, User Research, SQL, Mixpanel, Jira, Agile/Scrum, 
       baseProfilesList.innerHTML = profileKeys.map(k => `
         <div class="base-profile-card">
           <div>
-            <h4>📁 ${k}</h4>
-            <span style="font-size:11px; color:#94a3b8;">${savedBaseProfiles[k].slice(0, 45)}...</span>
+            <h4>📁 ${escapeHtml(k)}</h4>
+            <span style="font-size:11px; color:#94a3b8;">${escapeHtml(String(savedBaseProfiles[k]).slice(0, 45))}...</span>
           </div>
-          <button class="btn secondary btn-sm" style="font-size:11px;" onclick="loadBaseProfile('${k}')">Load</button>
+          <button class="btn secondary btn-sm load-profile-btn" style="font-size:11px;" data-profile="${escapeHtml(k)}">Load</button>
         </div>
       `).join('');
     }
@@ -298,30 +303,43 @@ Product Strategy, A/B Testing, User Research, SQL, Mixpanel, Jira, Agile/Scrum, 
       <div class="vault-card-item">
         <div style="flex-grow: 1;">
           <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px;">
-            <span style="font-size: 10px; background: rgba(16, 185, 129, 0.2); color: #10b981; padding: 2px 8px; border-radius: 12px; font-weight: 700;">${item.category}</span>
-            <span style="font-size: 11px; color: #64748b;">${item.created_at}</span>
+            <span style="font-size: 10px; background: rgba(16, 185, 129, 0.2); color: #10b981; padding: 2px 8px; border-radius: 12px; font-weight: 700;">${escapeHtml(item.category)}</span>
+            <span style="font-size: 11px; color: #64748b;">${escapeHtml(item.created_at)}</span>
           </div>
-          <p style="font-size: 13px; color: var(--palette-navy); font-weight: 600; line-height: 1.4;">• ${item.text}</p>
+          <p style="font-size: 13px; color: var(--palette-navy); font-weight: 600; line-height: 1.4;">• ${escapeHtml(item.text)}</p>
         </div>
         <div style="display: flex; gap: 6px;">
-          <button class="btn secondary btn-sm" style="font-size: 11px;" onclick="copySnippetText('${encodeURIComponent(item.text)}')">📋 Copy</button>
-          <button class="btn secondary btn-sm" style="font-size: 11px; color: #ef4444;" onclick="deleteSnippet(${item.id})">🗑️</button>
+          <button class="btn secondary btn-sm copy-snippet-btn" style="font-size: 11px;" data-snippet="${escapeHtml(item.text)}">📋 Copy</button>
+          <button class="btn secondary btn-sm delete-snippet-btn" style="font-size: 11px; color: #ef4444;" data-snippet-id="${escapeHtml(String(item.id))}" title="Delete snippet">🗑️</button>
         </div>
       </div>
     `).join('');
   }
 
-  window.copySnippetText = (encodedText) => {
-    const text = decodeURIComponent(encodedText);
-    navigator.clipboard.writeText(text);
-    alert('Bullet snippet copied to clipboard!');
-  };
+  // (removed) legacy copySnippetText helper used inline onclick + encodeURIComponent;
+  // snippet copy is now handled via data-snippet attributes + delegated listener below.
 
-  window.deleteSnippet = (id) => {
+  function deleteSnippetById(id) {
     savedSnippets = savedSnippets.filter(s => s.id !== id);
     localStorage.setItem('tailorfit_snippets', JSON.stringify(savedSnippets));
     filterAndRenderSnippets();
   };
+
+  // Delegated handlers for vault buttons (avoids inline onclick string injection)
+  baseProfilesList.addEventListener('click', (e) => {
+    const btn = e.target.closest('.load-profile-btn');
+    if (btn) window.loadBaseProfile(btn.dataset.profile);
+  });
+  vaultSnippetsList.addEventListener('click', (e) => {
+    const copyBtnEl = e.target.closest('.copy-snippet-btn');
+    if (copyBtnEl) {
+      navigator.clipboard.writeText(copyBtnEl.dataset.snippet || '');
+      alert('Bullet snippet copied to clipboard!');
+      return;
+    }
+    const delBtn = e.target.closest('.delete-snippet-btn');
+    if (delBtn) deleteSnippetById(Number(delBtn.dataset.snippetId));
+  });
 
   // Optimize Action Handler
   optimizeBtn.addEventListener('click', async () => {
@@ -337,31 +355,54 @@ Product Strategy, A/B Testing, User Research, SQL, Mixpanel, Jira, Agile/Scrum, 
     optimizeBtn.textContent = '⚡ Scanning & Tailoring ATS Resume...';
 
     try {
-      const response = await fetch('/api/tailor-resume', {
+      // Server contract: POST /api/analyze { resume, jobDescription } ->
+      // { original_score, optimized_score, score_breakdown, missing_keywords,
+      //   executive_summary, optimized_resume, cover_letter, id }
+      const headers = { 'Content-Type': 'application/json' };
+      const token = getToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const response = await fetch('/api/analyze', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           resume: rawResume,
           jobDescription: rawJob
         })
       });
 
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
 
-      if (data.status === 'success' || data.optimizedResume) {
+      if (!response.ok) {
+        alert(data.error || `Analysis failed (HTTP ${response.status}).`);
+        return;
+      }
+
+      if (data && (typeof data.optimized_score !== 'undefined' || data.optimized_resume)) {
         resultsPanel.classList.remove('hidden');
-        origScoreEl.textContent = `${data.originalScore || 58}%`;
-        optScoreEl.textContent = `${data.optimizedScore || 95}%`;
+        origScoreEl.textContent = `${data.original_score ?? 58}%`;
+        optScoreEl.textContent = `${data.optimized_score ?? 95}%`;
 
-        outputResumeEl.value = data.optimizedResume || data.resume;
-        outputCoverEl.value = data.coverLetter || 'Tailored Cover Letter generated successfully.';
-        execSummaryEl.textContent = `⚡ Key Insight: ${data.executiveSummary || 'Resume rewritten to match primary job requirements.'}`;
+        outputResumeEl.value = data.optimized_resume || '';
+        outputCoverEl.value = data.cover_letter || 'Tailored Cover Letter generated successfully.';
+        execSummaryEl.textContent = `⚡ Key Insight: ${data.executive_summary || 'Resume rewritten to match primary job requirements.'}`;
 
-        if (data.missingKeywords && data.missingKeywords.length > 0) {
-          missingKwWrapper.innerHTML = data.missingKeywords.map(kw => `<span class="tag missing">+ ${kw}</span>`).join('');
+        const breakdown = data.score_breakdown || {};
+        const setSub = (id, val) => {
+          const el = document.getElementById(id);
+          if (el && typeof val !== 'undefined') el.textContent = `${val}%`;
+        };
+        setSub('sub-kw-match', breakdown.keyword_match);
+        setSub('sub-fmt', breakdown.formatting);
+        setSub('sub-metrics', breakdown.quantified_metrics);
+        setSub('sub-skills', breakdown.hard_skills);
+
+        if (data.missing_keywords && data.missing_keywords.length > 0) {
+          missingKwWrapper.innerHTML = data.missing_keywords.map(kw => `<span class="tag missing">+ ${escapeHtml(kw)}</span>`).join('');
+        } else {
+          missingKwWrapper.innerHTML = '';
         }
       } else {
-        alert('Failed to optimize resume.');
+        alert(data.error || 'Failed to optimize resume.');
       }
     } catch (err) {
       console.error(err);
@@ -422,28 +463,36 @@ Product Strategy, A/B Testing, User Research, SQL, Mixpanel, Jira, Agile/Scrum, 
 
   closeModalBtn.addEventListener('click', () => { authModal.classList.add('hidden'); });
 
+  // Server contract: GET /api/history -> { history: [...] } (object, NOT a bare array)
   async function loadHistory() {
     historyContainer.innerHTML = '<p style="color:#94a3b8;">Loading history...</p>';
     try {
-      const res = await fetch('/api/history');
-      const data = await res.json();
-      if (!data || data.length === 0) {
+      const headers = {};
+      const token = getToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch('/api/history', { headers });
+      const data = await res.json().catch(() => ({}));
+      const items = Array.isArray(data) ? data : (data.history || []);
+      if (!items || items.length === 0) {
         historyContainer.innerHTML = '<p style="color:#94a3b8;">No past scans found in history.</p>';
         return;
       }
-      historyContainer.innerHTML = data.map(item => `
+      historyContainer.innerHTML = items.map(item => `
         <div style="background: rgba(255,255,255,0.8); border: 1px solid var(--palette-navy); border-radius: 8px; padding: 12px; margin-bottom: 10px;">
           <div style="display:flex; justify-content:space-between; margin-bottom: 6px;">
-            <span style="font-weight: 700;">Scan #${item.id} — ${item.created_at || ''}</span>
-            <span style="color:#10b981; font-weight:700;">Score: ${item.optimized_score || 95}%</span>
+            <span style="font-weight: 700;">Scan #${escapeHtml(String(item.id))} — ${escapeHtml(item.created_at || '')}</span>
+            <span style="color:#10b981; font-weight:700;">Score: ${escapeHtml(String(item.optimized_score ?? 95))}%</span>
           </div>
-          <pre style="font-size: 11px; max-height: 60px; overflow: hidden;">${(item.optimized_resume || '').slice(0, 150)}...</pre>
+          <pre style="font-size: 11px; max-height: 60px; overflow: hidden;">${escapeHtml(String(item.optimized_resume || '').slice(0, 150))}...</pre>
         </div>
       `).join('');
     } catch(err) {
       historyContainer.innerHTML = '<p style="color:red;">Failed to load history.</p>';
     }
   }
+
+  const refreshHistoryBtn = document.getElementById('refresh-history-btn');
+  if (refreshHistoryBtn) refreshHistoryBtn.addEventListener('click', loadHistory);
 
   checkAuth();
 });
